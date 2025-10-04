@@ -1,0 +1,1653 @@
+---
+title: "Insect_Arach_R"
+author: "Wes Walsh"
+date: "2025-06-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::purl(input = "Walsh_Figueroa_R.Rmd", output = "Walsh_Figueroa.R")
+#tinytex::install_tinytex()
+```
+
+# Set Up
+```{r Load packages, include=FALSE}
+#Get packages used
+require(here)
+require(car)
+require(DHARMa)
+require(emmeans)
+require(MASS)
+library(tidyverse)
+library(lme4)
+library(MuMIn)
+library(AICcmodavg)
+library(GGally)
+library(gridExtra)
+library(ggsignif)
+library(ggpubr)
+
+#Increase visible console output rows 
+options(max.print=1000000)
+
+#citation("gridExtra")
+
+#citation()
+#version$version.string
+```
+
+# 1 North American NatureServe 
+Here we examine all insect and arachnid species in Canada and the United States excluding Hawaii. We use this range because it matches the geographic range of the described species counts.
+```{r north amer data}
+
+north_amer <- read.csv(here("data", "North_American_Nat_Serve_Spec.csv"))
+
+#Convert to factor
+north_amer <- north_amer |>
+  mutate(across(c(Order, Family, Genus, Global_Number, assessed, at_risk, status, state_protected, fed_protected), as.factor))
+
+table(north_amer$status)
+
+#Exclude Acari
+#north_amer_noacari<- north_amer %>%
+#  filter(Order != "Ixodida" & Order != "Mesostigmata" & Order != "Sarcoptiformes" & Order != "Trombidiformes") 
+
+
+#Count at-risk entries
+#north_amer_noacari %>%
+north_amer %>%
+  filter(Global_Number == "1" | Global_Number == "2" | Global_Number == "3") %>%
+  summarise(count = n())
+
+#Count stable
+north_amer %>%
+  filter(Global_Number == "4" | Global_Number == "5") %>%
+  summarise(count = n())
+
+#Count unassessed entries
+#north_amer_noacari %>%
+north_amer %>%
+  filter(Global_Number == "R" | Global_Number == "U") %>%
+  summarise(count = n())
+
+```
+
+### By Order
+Calculate entries, assessment, and statuses for each order
+```{r NatureServe Entries per Order}
+
+#Count entries per order
+#order_entries <- north_amer_noacari %>%
+order_entries <- north_amer %>%
+  group_by(Order) %>%
+  summarize(count=n())
+
+#Rename column
+order_entries <- order_entries%>% rename(entries=count)
+
+#Count entries in each order with each status
+#order_by_status <- north_amer_noacari %>%
+order_by_status <- north_amer %>%
+  group_by(Order, status) %>%
+  summarise(count = n())
+
+#Pivot to wide
+order_by_status <- pivot_wider(order_by_status, names_from = status, values_from = count)
+
+#Replace nas with 0s
+order_by_status[is.na(order_by_status)] <- 0
+
+#Merge
+north_amer_orders <- merge(order_entries, order_by_status, by = "Order", all.x = TRUE)
+remove(order_entries)
+remove(order_by_status)
+
+#Dbl check
+#Add up entries per status
+north_amer_orders$sum <-north_amer_orders$not_assessed + north_amer_orders$assessed_norisk + north_amer_orders$assessed_risk + north_amer_orders$assessed_extinct
+
+#Verify number of entries = sum of entries per status
+north_amer_orders$check <- ifelse(north_amer_orders$entries == north_amer_orders$sum, "Okay", "Hold Up There Partner!")
+
+#Remove check columns
+north_amer_orders <- north_amer_orders[, !names(north_amer_orders) %in% c("sum", "check")]
+
+#Calculate percentage of assessed per status
+north_amer_orders <- north_amer_orders %>%
+  mutate(assessed = assessed_norisk + assessed_risk +assessed_extinct) %>%
+  mutate(percRisk = (assessed_risk/assessed)*100) %>%
+  mutate(percNorisk = (assessed_norisk/assessed)*100) %>%
+  mutate(percExtinct = (assessed_extinct/assessed)*100) 
+
+#Calculate percentage of entries per status
+ north_amer_orders <- north_amer_orders %>%
+  mutate(percRiskEntry = (assessed_risk/entries)*100) %>%
+  mutate(percNoriskEntry = (assessed_norisk/entries)*100) %>%
+  mutate(percExtinctEntry = (assessed_extinct/entries)*100) %>%
+  mutate(percNoassessEntry = (not_assessed/entries)*100)
+```
+
+
+## Described vs NatureServe entries
+Compare NatureServe against described species to determine the extent to which described species have been assessed
+```{r Described vs NatureServe entries}
+
+described_all <- read.csv(here("data", "described_final.csv"))
+
+#Just order and described
+described_orders <- described_all[,1:2]
+
+#Total described
+sum(described_all$northAmerDescribed)
+
+#Remove white space
+described_orders$Order <- trimws(described_orders$Order)
+
+#Merge with count of entries on NatureServe
+north_amer_orders <- merge(described_orders, north_amer_orders, by='Order', all.y=TRUE,all.x=TRUE)
+
+remove(described_orders)
+
+#Replce nas for entries with 0s
+north_amer_orders$entries[is.na(north_amer_orders$entries)] <- 0
+
+#Calculate percent of described species with entries by order
+north_amer_orders$perc_NorthAmerentries <- (north_amer_orders$entries/north_amer_orders$northAmerDescribed)*100
+
+#Is the percent of described species with entries significantly different by order?
+#Visualize
+barplot(north_amer_orders$perc_NorthAmerentries~north_amer_orders$Order)
+
+#Compare
+chisq.test(na.omit(north_amer_orders$perc_NorthAmerentries)) #Sig
+
+#How many orders have less than half described species on NatureServe?
+north_amer_orders %>%
+  filter(perc_NorthAmerentries < 50) %>%
+  summarise(count = n())
+
+(29/41)*100
+
+```
+
+## North Amer Spec Models
+Are some orders in North America more likely to be assessed for conservation risk? Are some orders more likely to be at-risk?
+```{r North Amer Spec Models}
+#Liklihood of global assessment by order
+#Model
+global_assess <- glm(assessed ~ Order, north_amer, family = binomial)
+
+#Don't run this next line of code unless you have time to kill
+global_assess_resid <- simulateResiduals(global_assess, n = 1000, plot = TRUE)
+
+summary(global_assess)
+Anova(global_assess)
+
+#Posthoc
+global_assess_posthoc <- emmeans(global_assess, ~Order)
+global_assess_posthoc_pairs <- as.data.frame(pairs(global_assess_posthoc))
+write.csv(global_assess_posthoc_pairs, "globalassesspairs.csv")
+
+remove(global_assess_posthoc, global_assess_posthoc_pairs, global_assess, global_assess_resid)
+
+#Liklihood of being at-risk by order (if assessed)
+north_amer_assessed <- north_amer |>
+  filter(assessed == "1")
+
+#Model
+north_amer_atrisk <- glm(at_risk ~ Order, north_amer_assessed, family = binomial)
+
+#Don't run this next line of code unless you have time to kill
+north_amer_atrisk_resid <- simulateResiduals(north_amer_atrisk, n = 1000, plot = TRUE)
+
+summary(north_amer_atrisk)
+Anova(north_amer_atrisk)
+
+#Posthoc
+north_amer_atrisk_posthoc <- emmeans(north_amer_atrisk, ~Order)
+north_amer_atrisk_posthoc_pairs <- as.data.frame(pairs(north_amer_atrisk_posthoc))
+write.csv(north_amer_atrisk_posthoc_pairs, "northamerriskpairs.csv")
+
+remove(north_amer_atrisk_posthoc, north_amer_atrisk_posthoc_pairs, north_amer_atrisk, north_amer_atrisk_resid)
+```
+
+# 2 US Species
+Here we are looking at NatureServe species who have been confirmed in the US and their likelihood of protection. It includes subspecies because fed and state laws treat them as separate entities and it includes Hawaii since federal and state law protects species there.
+```{r US data}
+
+species_full <- read.csv(here("data", "USspecies_final.csv"))
+
+#Set as factors
+#Insects & Arachnids
+species_full <- species_full |>
+  mutate(across(c(Class, Order, Family,
+              Genus, Global_Number, US_Number, Hybrid_Number, Protected, State_Protected, Fed_Protected, Protected_Lvl), as.factor))
+
+#Count where global risk used (and was not unranked)
+species_full %>%
+  filter(as.character(Global_Number) == as.character(Hybrid_Number))%>%
+  filter(Hybrid_Number != "R" & Hybrid_Number != "U") %>%
+  summarize(count = n())
+
+#Count number where US rank used (and was not unranked)
+species_full %>%
+  filter(as.character(Global_Number) != as.character(Hybrid_Number) & as.character(Global_Number) != as.character(Hybrid_Number)) %>%
+  filter(Hybrid_Number != "R" & Hybrid_Number != "U") %>%
+  summarize(count = n())
+
+#Count hybrid unassessed
+species_full %>%
+  filter(Hybrid_Number == "R" | Hybrid_Number == "U") %>%
+  summarize(count = n())
+
+#--------------------------------------------------------------------------
+#Count entries per order
+usorder_entries <- species_full %>%
+  group_by(Order) %>%
+  summarize(count=n())
+
+#Rename column
+usorder_entries <- usorder_entries%>% rename(entries=count)
+
+#Count entries in each order with each status
+usorder_by_status <- species_full %>%
+  group_by(Order, Hybrid_Number) %>%
+  summarise(count = n())
+
+#Pivot to wide
+usorder_by_status <- pivot_wider(usorder_by_status, names_from = Hybrid_Number, values_from = count)
+
+#Replace nas with 0s
+usorder_by_status[is.na(usorder_by_status)] <- 0
+
+#Merge
+us_orders <- merge(usorder_entries, usorder_by_status, by = "Order", all.x = TRUE)
+remove(usorder_entries)
+remove(usorder_by_status)
+
+#Add H to hybrid ranks
+us_orders<-us_orders %>% rename_with(~ paste0("h", .x))
+
+#Calculate percentage of entries per status
+us_orders <- us_orders %>%
+  mutate(percRisk = ((h1+h2+h3)/hentries)*100) %>%
+  mutate(percNorisk = ((h4+h5)/hentries)*100) %>%
+  mutate(percExtinct = ((hH + hX)/hentries)*100) %>%
+  mutate(percNoassess = ((hU + hR)/hentries)*100)
+
+#Calculate percentage per assessed entries
+us_orders <- us_orders %>%
+  mutate(assessed = (h1+h2+h3+h4+h5+hH+hX)) %>%
+  mutate(percAssessNorisk = ((h4+h5)/assessed)*100) %>%
+  mutate(percAssessExtinct = ((hH + hX)/assessed)*100) %>%
+  mutate(percAssessRisk = ((h1 + h2 + h3)/assessed)*100)
+
+#Save table
+write.csv(us_orders, "us_spec_summary.csv")
+
+```
+
+## Correl btw ranks
+To minimize the number of unassessed species for analysis, we use a "hybrid" extinction risk which consists of global rank when available, and US rank for species that have been assessed nationally but not globally. To ensure a "hybrid rank" is appropriate, we test the correlation between US and global ranks
+```{r Correl btw ranks}
+
+#Only entries with numeric rankings
+species_numb <- species_full |>
+  filter(between(as.numeric(Global_Number), 1,5) &   between(as.numeric(US_Number),1,5))
+  
+table(species_numb$Global_Number, species_numb$US_Number)
+
+cor.test(as.numeric(species_numb$Global_Number), as.numeric(species_numb$US_Number), method = "kendall")
+
+#Only entries with categorical rankings
+species_cat <- species_full |>
+  filter(Global_Number!= 1 &  Global_Number!=2 & Global_Number!=3 & Global_Number!=4 & Global_Number !=5 & US_Number!= 1 &  US_Number!=2 & US_Number!=3 & US_Number!=4 & US_Number !=5)
+  
+table(species_cat$Global_Number, species_cat$US_Number)
+chisq.test(species_cat$Global_Number, species_cat$US_Number)
+
+remove(species_cat, species_numb)
+```
+
+## At-Risk Spec Protected
+Calculating how many at-risk species are protected and whether that differs by order
+```{r perc hybrid at-risk protected}
+
+#Keep just the US at-risk entries
+species_atrisk <- species_full |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3")
+
+#Count federally protected
+species_atrisk %>%
+  group_by(Fed_Protected) %>%
+  summarize(count = n())
+
+#Count state protected
+species_atrisk %>%
+  group_by(State_Protected) %>%
+  summarize(count = n())
+
+#Count protected
+species_atrisk %>%
+  group_by(Protected) %>%
+  summarize(count = n())
+
+
+#Protected/unprotected by order
+protected_by_order<-species_atrisk %>%
+  group_by(Order, Protected) %>%
+  summarize(count = n())
+
+#Pivot wider
+protected_by_order <- pivot_wider(protected_by_order, names_from = Protected, values_from = count)
+
+#Rename columns
+names(protected_by_order)[names(protected_by_order) == "Protected"] <- "Order"
+names(protected_by_order)[names(protected_by_order) == "0"] <- "Unprotected"
+names(protected_by_order)[names(protected_by_order) == "1"] <- "Protected"
+
+#Add column with percent protected of all at-risk species
+protected_by_order$percProtected <- (protected_by_order$Protected/(protected_by_order$Unprotected+protected_by_order$Protected)*100)
+
+remove(species_atrisk)
+```
+
+## Birds
+Perhaps the federal ESA just lists very few species. To see whether this is the case, we compare the number of at-risk birds from the same range on NatureServe that are federally protected 
+```{r Birds}
+#Birds
+birds <- read.csv(here("data", "USbirds.csv"))
+
+#Set factors
+birds <- birds|>
+  mutate(across(c(Hybrid_Number, Fed_Protected), as.factor))
+
+#Count hybrid unassessed
+birds %>%
+  filter(Hybrid_Number == "R" | Hybrid_Number == "U") %>%
+  summarize(count = n())
+#74
+
+#Keep just the at-risk entries
+birds_atrisk <- birds |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3")
+
+#Count federally protected
+birds_atrisk %>%
+  group_by(Fed_Protected) %>%
+  summarize(count = n())
+#57
+
+```
+
+## Order Lvl Bias 
+Here we look at how taxonomic order and extinction risk affect a species likelihood of being protected at the state and federal levels. We create a general function and run it for both state and federal levels.
+```{r Order Hybrid}
+
+#General function testing role of hybrid rank and order on protection
+order_bias <- function(x)
+{
+  mod <- glm(x ~ Hybrid_Number + Order, species_full, family = binomial)
+}
+
+#Protection levels
+protected_lvls <- species_full[c("State_Protected", "Fed_Protected")]
+
+#Apply
+order_bias_mods<-lapply(protected_lvls,order_bias)
+
+#Check model/evaluate
+for (i in order_bias_mods) {
+  #resid <- simulateResiduals(i, n = 1000, plot = TRUE)
+  print(summary(i))
+  print(Anova(i))
+}
+
+Anova(order_bias_mods$Fed_Protected)
+
+#Posthoc order
+state_order_posthoc <- emmeans(order_bias_mods$State_Protected, ~Order)
+state_order_posthoc_pairs <- as.data.frame(pairs(state_order_posthoc))
+write.csv(state_order_posthoc_pairs, "stateorderpairs.csv")
+
+fed_order_posthoc <- emmeans(order_bias_mods$Fed_Protected, ~Order)
+fed_order_posthoc_pairs <- as.data.frame(pairs(fed_order_posthoc))
+write.csv(fed_order_posthoc_pairs, "fedorderpairs.csv")
+
+#Posthoc rank
+state_rank_posthoc <- emmeans(order_bias_mods$State_Protected, ~Hybrid_Number)
+state_rank_posthoc_pairs <- as.data.frame(pairs(state_rank_posthoc))
+write.csv(state_rank_posthoc_pairs, "staterankpairs.csv")
+
+fed_rank_posthoc <- emmeans(order_bias_mods$Fed_Protected, ~Hybrid_Number)
+fed_rank_posthoc_pairs <- as.data.frame(pairs(fed_rank_posthoc))
+write.csv(fed_rank_posthoc_pairs, "fedrankpairs.csv")
+
+remove(state_order_posthoc_pairs, state_order_posthoc, fed_order_posthoc_pairs, fed_order_posthoc)
+```
+
+## Order Lvl NOhio
+Ohio lists a large number of odonates. To see whether that explains the state Odonata bias, we rerun the state level order bias model after treating odonates only protected in Ohio as not-protected
+```{r Order level bias Nohio}
+
+#Create new df in which odonates only protected in Ohio are not counted as protected
+species_no_ohio <- species_full %>%
+  mutate(Protected = if_else(Where_Protected == "Ohio" & Order == "Odonata", "0", Protected))%>%
+  mutate(State_Protected = if_else(Where_Protected == "Ohio" & Order == "Odonata", "0", State_Protected))
+
+#Set as factors
+species_no_ohio <- species_no_ohio |>
+  mutate(across(c(Protected, State_Protected), as.factor))
+
+#Model
+state_order_nohio <- glm(State_Protected ~ Hybrid_Number + Order, species_no_ohio, family = binomial)
+
+#Check
+state_order_nohio_resid <- simulateResiduals(state_order_nohio, n = 1000, plot = TRUE)
+vif(state_order_nohio)
+
+#Analyze  
+summary(state_order_nohio)
+Anova(state_order_nohio)
+
+#Posthoc
+state_order_nohio_posthoc <- emmeans(state_order_nohio, ~Order)
+state_order_nohio_posthoc_pairs <- as.data.frame(pairs(state_order_nohio_posthoc))
+write.csv(state_order_nohio_posthoc_pairs, "stateorderNOhiopairs.csv")
+
+remove(state_order_nohio_posthoc_pairs, state_order_nohio_resid, state_order_nohio_posthoc, state_order_nohio)
+```
+
+## Order Lvl No Droph
+The federal ESA lists many species of Drosophila from Hawaii in multi-species listings. To see what effect this has on federal order bias, we treat the 14 Drosophila as a single listing and rerun the model.
+```{r Order no droph}
+#Remove all but one of the protected Drosophila 
+
+species_no_droph <- species_full %>%
+  filter(Scientific.Name != "Drosophila differens" & 
+          Scientific.Name != "Drosophila digressa" &  
+          Scientific.Name != "Drosophila hemipeza" &  
+          Scientific.Name != "Drosophila heteroneura" &
+          Scientific.Name != "Drosophila montgomeryi" &
+          Scientific.Name != "Drosophila mulli" & 
+          Scientific.Name != "Drosophila musaphilia" &
+          Scientific.Name != "Drosophila neoclavisetae" &
+          Scientific.Name != "Drosophila obatai" &
+          Scientific.Name != "Drosophila ochrobasis" &
+          Scientific.Name != "Drosophila sharpi" & 
+          Scientific.Name != "Drosophila substenoptera" &
+          Scientific.Name != "Drosophila tarphytrichia"
+           )
+
+
+species_no_droph %>%
+  group_by(Order, Fed_Protected) %>%
+  summarize(count=n())
+
+#Model
+fed_order_nodroph <- glm(Fed_Protected ~ Hybrid_Number + Order, species_no_droph, family = binomial)
+
+#Check
+fed_order_nodroph_resid <- simulateResiduals(fed_order_nodroph, n = 1000, plot = TRUE)
+vif(fed_order_nodroph)
+
+#Analyze  
+summary(fed_order_nodroph)
+Anova(fed_order_nodroph)
+
+#Posthoc
+fed_order_nodroph_posthoc <- emmeans(fed_order_nodroph, ~Order)
+fed_order_nodroph_posthoc_pairs <- as.data.frame(pairs(fed_order_nodroph_posthoc))
+write.csv(fed_order_nodroph_posthoc_pairs, "NODROPHfedorderpairs.csv")
+
+remove(fed_order_nodroph_posthoc_pairs, fed_order_nodroph, fed_order_nodroph_resid, fed_order_nodroph_posthoc, species_no_droph)
+```
+
+## Family Lvl
+Looking at family-level taxonomic bias at the federal and state level for all orders with more than 10 protected species
+```{r Create Order dataframes}
+
+lepidoptera <-species_full |>
+  filter(Order == "Lepidoptera")
+
+odonata <-species_full |>
+  filter(Order == "Odonata")
+
+coleoptera <-species_full |>
+  filter(Order == "Coleoptera")
+
+diptera <-species_full |>
+  filter(Order == "Diptera")
+
+trichoptera <-species_full |>
+  filter(Order == "Trichoptera")
+
+hymenoptera <-species_full |>
+  filter(Order == "Hymenoptera")
+
+hemiptera <-species_full |>
+  filter(Order == "Hemiptera")
+
+#Put each dataframe in a list 
+order_list <- list(lep = lepidoptera, 
+                   odon = odonata, 
+                   coleo = coleoptera, 
+                   dip = diptera, 
+                   trich = trichoptera, 
+                   hym = hymenoptera, 
+                   hemi = hemiptera)
+```
+
+Analysis
+```{r Family models}
+#State
+#Protected State function
+state_protected <- function(x)
+{
+  state_protected_fam <- glm(State_Protected ~ Family + Hybrid_Number, data = x, family =   binomial)
+
+}
+
+#Apply to orders
+state_protected_mods <- lapply(order_list, state_protected)
+
+#Check models
+for (i in state_protected_mods) {
+  #print(i)
+  print(vif(i))
+  #resid <- simulateResiduals(i, n = 1000, plot =    TRUE)
+  #print(Anova(i))
+}
+
+
+#GVIF 2.8 for Diptera, 4921.8 for Hemiptera
+#Repeat analysis for protected state for dip, hemi
+state_protected_retest_orders <- list( 
+                   dip = diptera, 
+                   hemi = hemiptera)
+
+#Without rank
+state_protected_no_rank <- function(x)
+{
+  state_protected_fam <- glm(State_Protected ~ Family, data = x, family =   binomial)
+
+}
+
+#Apply to orders with colinearity problems
+state_fam_bias_mods_no_rank <- lapply(state_protected_retest_orders, state_protected_no_rank)
+
+#Check models
+for (i in state_fam_bias_mods_no_rank) {
+  resid <- simulateResiduals(i, n = 1000, plot =    TRUE)
+  print(Anova(i))
+}
+
+#---------------------------------------------------------------------------------------
+#Federal
+#No federally protected Trichoptera, so remove from order list
+order_list[["trich"]] <- NULL
+
+#Protected Fed function
+fed_protected <- function(x)
+{
+  fed_protected_fam <- glm(Fed_Protected ~ Family + Hybrid_Number, data = x, family =   binomial)
+}
+
+fed_protected_mods <- lapply(order_list, fed_protected) 
+
+#Check models
+for (i in fed_protected_mods) {
+  #print(vif(i))
+  #resid <- simulateResiduals(i, n = 1000, plot =    TRUE)
+  print(Anova(i))
+}
+
+#GVIF 16.5 for Col, 11.1 for Dip, 4.7 for Hemi 
+#Repeat fed protected for col, dip. hemi
+fed_protected_retest_orders <- list(
+                                    col = coleoptera,
+                                    dip = diptera, 
+                                    hemi = hemiptera)
+
+#Function without rank
+fed_protected_no_rank <- function(x)
+{
+  fed_protected_fam <- glm(Fed_Protected ~ Family, data = x, family =   binomial)
+
+}
+
+#Apply to orders with colinearity problems
+fed_fam_bias_mods_no_rank <- lapply(fed_protected_retest_orders, fed_protected_no_rank)
+
+#Check models
+for (i in fed_fam_bias_mods_no_rank) {
+  #resid <- simulateResiduals(i, n = 1000, plot =    TRUE)
+  print(Anova(i))
+}
+
+#Get rid of all this junk from global environment
+remove(order_list, state_fam_bias_mods_no_rank, state_protected_retest_orders, state_protected, state_protected_mods, fed_protected, fed_protected_mods, fed_protected_retest_orders, fed_protected_no_rank, fed_fam_bias_mods_no_rank, coleoptera, diptera, lepidoptera, odonata, trichoptera, hymenoptera, hemiptera, state_protected_no_rank,resid,i)
+```
+
+## Family Lvl NOhio
+Rerun the state level family model after treating odonates only protected in Ohio as unprotected to see whether Ohio protections alone are driving bias
+```{r Family nohio}
+
+#Create new df in which odonates only protected in Ohio are not counted as protected
+species_no_ohio <- species_full %>%
+  mutate(Protected = if_else(Where_Protected == "Ohio" & Order == "Odonata", "0", Protected))%>%
+  mutate(State_Protected = if_else(Where_Protected == "Ohio" & Order == "Odonata", "0", State_Protected))
+
+#Set as factors
+species_no_ohio <- species_no_ohio |>
+  mutate(across(c(Protected, State_Protected), as.factor))
+
+#Odonata
+odonata_nohio <- species_no_ohio |>
+  filter(Order == "Odonata")
+
+#Model
+state_protected_fam_nohio <- glm(as.factor(State_Protected) ~ Family + Hybrid_Number, 
+                              data = odonata_nohio, family =   binomial)
+
+#Analyze
+vif(state_protected_fam_nohio)
+state_protected_fam_nohio_resid <- simulateResiduals(state_protected_fam_nohio, n = 1000, plot =    TRUE) 
+
+summary(state_protected_fam_nohio)
+Anova(state_protected_fam_nohio)
+
+remove(odonata_nohio, state_protected_fam_nohio, species_no_ohio, state_protected_fam_nohio_resid)
+```
+
+# 3 Federal Petition
+Species may be petitioned by the public for listing or proposed by USFWS. Here we look at whether species protected through petition are taxonomic ally different than those that USFWS 
+```{r fed petition}
+fed_petition <- read.csv(here("data", "fed_final.csv"))
+
+#Convert variables to factors
+fed_petition <- fed_petition |>
+  mutate(across(c(Class, Order, Hybrid_Number,petition,aquatic,predator), as.factor))
+
+table(fed_petition$petition)
+
+#By order
+order_pet<-fed_petition %>%
+  group_by(Order, petition) %>%
+  summarize(count=n()) %>%
+  rename(species = count) %>%
+  mutate(petition = recode(petition,
+    "0" = "No_Petition",
+    "1" = "Petition"
+  ))
+
+#Piot wider
+order_pet <- pivot_wider(
+  order_pet,
+  names_from = petition,
+  values_from = species
+)
+
+#Replace nas with 0s
+order_pet[is.na(order_pet)] <- 0
+
+#Percent petitioned
+order_pet <- order_pet %>%
+  mutate(perc_pet = (Petition/(Petition+No_Petition))*100)
+
+
+#Does year or order predict whether a species is petitioned
+petition <- glm(petition ~ Order, fed_petition, family = binomial)
+summary(petition)
+
+simulateResiduals(petition, n=100, plot = TRUE)
+
+Anova(petition)
+
+#Posthoc
+pet_ord <- emmeans(petition, ~Order)
+pet_ord_pairs <- as.data.frame(pairs(pet_ord))
+pet_ord_pairs
+
+
+```
+
+#4 State Laws
+Here we look at state conservation policies in each state and potential ecological, economic, and social explanations for the differences
+```{r getting states csv}
+
+states <- read.csv(here("data", "states_final.csv"))
+
+#Convert variables to factors
+states <- states |>
+  mutate(across(c(State, SESA, Ins.ArachIncl), as.factor))
+```
+
+## Have SESA
+Why do some states have a state endangered species act (SESA) but others do not?
+```{r}
+#How many with SESAs?
+table(states$SESA)
+
+#Pairs of predictor variables
+ggpairs(states[,c("SESA", "percFederal", "Eco.Area", "R1.Area", "Extract.Total", "Total_GDP", "Mut", "Hybrid_AtRisk")]) 
+
+#Global Model
+sesa <- glm(SESA ~ percFederal + Eco.Area + R1.Area + Extract.Total + Total_GDP + Mut + Hybrid_AtRisk, states, family = binomial)
+vif(sesa)
+#Drop total GDP
+
+sesa <- glm(SESA ~ percFederal + Eco.Area + R1.Area + Extract.Total + Mut + Hybrid_AtRisk, states, family = binomial)
+vif(sesa)
+#Drop R1s
+
+sesa <- glm(SESA ~ percFederal + Eco.Area + Extract.Total + Mut + Hybrid_AtRisk, states, family = binomial)
+vif(sesa)
+#Split mut and at-risk
+
+#Mut
+sesa_mut <- glm(SESA ~ percFederal + Eco.Area + Extract.Total + Mut, states, family = binomial)
+vif(sesa_mut)
+sesa_resid_mut <- simulateResiduals(sesa_mut, n = 1000, plot = TRUE)
+
+#At-Risk
+sesa_risk <- glm(SESA ~ percFederal + Eco.Area + Extract.Total + Hybrid_AtRisk, states, family = binomial)
+vif(sesa_risk)
+sesa_resid_risk <- simulateResiduals(sesa_risk, n = 1000, plot = TRUE)
+
+#Explore dredge with na omitted  
+states_nona <- na.exclude(states)
+
+#Mut
+sesa_nona_mut <- glm(SESA ~ percFederal + Eco.Area + Extract.Total + Mut, states_nona, family = binomial, na.action = na.fail)
+
+dredge(sesa_nona_mut) #Extract, Extract + Mut, Extract + percfed
+
+#At-Risk
+sesa_nona_risk <- glm(SESA ~ percFederal + Eco.Area + Extract.Total + Hybrid_AtRisk, states_nona, family = binomial, na.action = na.fail)
+
+dredge(sesa_nona_risk) #Extract
+
+#Compare top models (AIC delta < 2) from each, all contain extract
+#General function explaining SESA
+sesa <- function(x){
+  fml <- as.formula(paste("SESA ~ Extract.Total +", paste(x)))
+  sesa_mod_dummy <- glm(fml, states, family = binomial)
+}
+
+#Combo explan vars in top models
+sesa_vars <- list(
+  Mut = "Mut",
+  percFed = "percFederal"
+)
+
+#Create top models
+sesa_top_mods <- lapply(sesa_vars,sesa)
+
+#Add null
+sesa_top_mods$null <- glm(SESA ~ 1, states, family = binomial)
+
+#Add extract only
+sesa_top_mods$extr <- glm(SESA ~ Extract.Total, states, family = binomial)
+
+#Compare
+aictab(sesa_top_mods) #Extract and extract + mut
+
+summary(sesa_top_mods$extr)
+summary(sesa_top_mods$Mut)
+Anova(sesa_top_mods$extr)
+Anova(sesa_top_mods$Mut)
+
+remove(sesa_resid, sesa, sesa_nona, states_nona, sesa_vars, sesa_top_mods)
+```
+
+## Incl Insect/Arach
+Why do some states include insects and arachnids in their SESAs but others do not?
+```{r Incl}
+#Dataframe of states with lists
+states_w_lists <-states |>
+  filter(SESA == 1)
+
+#Create new dataframe, replace ambiguous with no
+states_w_lists_AmgN <- states_w_lists
+states_w_lists_AmgN['Ins.ArachIncl'][states_w_lists_AmgN['Ins.ArachIncl'] == 'Amg'] <- '0'
+
+#Pairs of predictor variables
+ggpairs(states_w_lists_AmgN[,c("Ins.ArachIncl","percFederal", "Eco.Area", "R1.Area", "Extract.Total", "Total_GDP", "Mut", "Hybrid_AtRisk", "state_atrisk")]) 
+
+#Global model
+incl <- glm(Ins.ArachIncl ~ percFederal + Eco.Area + R1.Area + Extract.Total + Total_GDP + Mut + Hybrid_AtRisk, states_w_lists_AmgN, family = binomial)
+vif(incl)
+
+#Drop total GDP
+incl <- glm(Ins.ArachIncl ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Mut + Extract.Total + state_atrisk, states_w_lists_AmgN, family = binomial)
+vif(incl)
+incl_resid <- simulateResiduals(incl, n = 1000, plot = TRUE)
+
+#Remove nas to explore with dredge
+states_w_lists_AmgNnona <- na.exclude(states_w_lists_AmgN)
+
+incl_nona <-glm(Ins.ArachIncl ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Mut + Extract.Total, states_w_lists_AmgNnona, family = binomial, na.action = na.fail)
+dredge(incl_nona) 
+#Extract + perf, Ext only, Ext + risk, Ext + eco + percfed, Ext + eco, Ext + mut + percf, Ext + risk + percfed
+
+#Top models (AIC delta < 2) all include extract alone or w/ other vars
+#General function explaining incl by extract and other vars
+incl_ext <- function(x){
+  fml <- as.formula(paste("Ins.ArachIncl ~ Extract.Total +", paste(x)))
+  incl_mod_dummy <- glm(fml, states_w_lists_AmgN, family = binomial)
+}
+
+#List of potential combinations
+incl_vars <- list(
+  perf = "percFederal",
+  risk = "Hybrid_AtRisk",
+  perfeco = "percFederal + Eco.Area",
+  eco = "Eco.Area",
+  percfmut = "percFederal + Mut",
+  riskperf = "Hybrid_AtRisk + percFederal"
+  )
+
+#Create models
+incl_ext_mods <- lapply(incl_vars, incl_ext)
+
+#Add ext only model
+incl_ext_mods$ext <- glm(Ins.ArachIncl ~ Extract.Total, states_w_lists_AmgN, family = binomial)
+
+#Add null model
+incl_ext_mods$null <- glm(Ins.ArachIncl ~ 1, states_w_lists_AmgN, family = binomial)
+
+#Simulate residuals
+for (i in incl_ext_mods) {
+  resid <- simulateResiduals(i, n = 1000, plot = TRUE)
+
+} #Quant dev percf
+
+#Try log transform
+hist(states_w_lists_AmgN$percFederal)
+states_w_lists_AmgN$logpercfed <- log(states_w_lists$percFederal)
+
+#Redo with transformed percfed
+incl_vars_logperc <- list(
+  perf = "logpercfed",
+  risk = "Hybrid_AtRisk",
+  perfeco = "logpercfed + Eco.Area",
+  eco = "Eco.Area",
+  percfmut = "logpercfed + Mut",
+  riskperf = "Hybrid_AtRisk + logpercfed"
+  )
+
+
+incl_ext_mods <- lapply(incl_vars_logperc, incl_ext)
+
+#Add extract only model
+incl_ext_mods$ext <- glm(Ins.ArachIncl ~ Extract.Total, states_w_lists_AmgN, family = binomial)
+
+#Simulate residuals
+for (i in incl_ext_mods) {
+  resid <- simulateResiduals(i, n = 1000, plot = TRUE)
+
+}
+#All good here
+
+aictab(incl_ext_mods)
+#pecfed, percfed + eco, ext, risk, eco
+
+#Just mods < 2 AICc of top
+incl_ext_mods <- list(
+  incl_ext_mods$perf,
+  incl_ext_mods$perfeco,
+  incl_ext_mods$ext,
+  incl_ext_mods$eco
+)
+
+#Summarize
+for (i in incl_ext_mods) {
+  print(summary(i))
+  print(Anova(i))
+
+}
+
+
+#Try again without Nevada, which appears to be an outlier for federal land
+states_w_lists_AmgN_noNevada <- states_w_lists_AmgN[!(states_w_lists_AmgN$State %in% "Nevada"),]
+
+incl_ext_nonevada <- function(x){
+  fml <- as.formula(paste("Ins.ArachIncl ~ Extract.Total +", paste(x)))
+  incl_mod_dummy <- glm(fml, states_w_lists_AmgN_noNevada, family = binomial)
+}
+
+incl_ext_nonevada_mods <- lapply(incl_vars, incl_ext_nonevada)
+
+for (i in incl_ext_nonevada_mods) {
+  resid <- simulateResiduals(i, n = 1000, plot = TRUE)
+
+}
+
+aictab(incl_ext_nonevada_mods)
+
+broom::tidy(incl_ext_mods$perf)
+
+remove(incl, incl_nona, incl_resid, states_w_lists, states_w_lists_AmgN, states_w_lists_AmgNnona)
+```
+
+## Number Listed
+For states with at least one listed species, what predicts total number of listed species?
+```{r Number Listed species}
+#Limit to only states with 1 or more species listed
+states_w_lists_one_plus <-states |>
+  filter(ListedTEBoth >= 1)
+
+hist(states_w_lists_one_plus$ListedTEBoth)
+#Right skewed
+
+ggpairs(states_w_lists_one_plus[,c("percFederal", "Eco.Area", "R1.Area", "Extract.Total", "Total_GDP", "Mut", "Hybrid_AtRisk")])
+
+#Global Model 
+listed <- glm(ListedTEBoth ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Mut + Extract.Total + Total_GDP, states_w_lists_one_plus, family = poisson) 
+vif(listed)
+
+#Hmm mut & eco correlated but both big variables of interest
+#Split mut and eco
+listed_mut <- glm(ListedTEBoth ~ percFederal + Hybrid_AtRisk + R1.Area + Mut + Extract.Total + Total_GDP, states_w_lists_one_plus, family = poisson) 
+vif(listed_mut)
+
+#Remove r1 from mut
+listed_mut <- glm(ListedTEBoth ~ percFederal + Hybrid_AtRisk + Mut + Extract.Total + Total_GDP, states_w_lists_one_plus, family = poisson) #na.action = na.fail)
+vif(listed_mut)
+
+#Remove extract from mut
+listed_mut <- glm(ListedTEBoth ~ percFederal + Hybrid_AtRisk + Mut + Total_GDP, states_w_lists_one_plus, family = poisson) 
+vif(listed_mut)
+
+#Remove hybrid at-risk
+listed_mut <- glm(ListedTEBoth ~ percFederal + Mut + Total_GDP, states_w_lists_one_plus, family = poisson) 
+vif(listed_mut)
+#Okay
+listed_mut_resid <-simulateResiduals(listed_mut, n=1000, plot = TRUE)
+#Oh no, that is very bad. Let's try a negbinomial
+
+#Eco area and other variables
+listed_eco <- glm(ListedTEBoth ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Extract.Total + Total_GDP, states_w_lists_one_plus, family = poisson) #na.action = na.fail)
+vif(listed_eco)
+listed_eco_resid <-simulateResiduals(listed_eco, n=1000, plot = TRUE)
+#Overdispersion > try neg binomial
+
+
+#Mut neg bi
+listed_mutnb <- glm.nb(ListedTEBoth ~ percFederal + Mut + Total_GDP, states_w_lists_one_plus)
+vif(listed_mutnb)
+listed_mutnb_resid <- simulateResiduals(listed_mutnb, n = 1000, plot = TRUE)
+#Quant dev, ns
+
+#Eco neg bi
+listed_extractnb <- glm.nb(ListedTEBoth ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Extract.Total + Total_GDP, states_w_lists_one_plus)
+vif(listed_extractnb)
+listed_extractb_resid <- simulateResiduals(listed_extractnb, n = 1000, plot = TRUE)
+#All good
+
+#Double checking whether negbi is appropriate
+#Chi_square test (>0.05 indicates adequate fit)
+dev <- summary(listed_mutnb)$deviance
+dof <- summary(listed_mutnb)$df.residual
+1-pchisq(dev,dof)
+#0.18; not great
+
+#dispersion parameter (want ~ 1)
+summary(listed_mutnb)$deviance/summary(listed_mutnb)$df.residual 
+#1.3, okay
+
+dev <- summary(listed_extractnb)$deviance
+dof <- summary(listed_extractnb)$df.residual
+1-pchisq(dev,dof)
+#0.08; not great
+summary(listed_extractnb)$deviance/summary(listed_mutnb)$df.residual 
+#1.17, okay
+
+#Explore with dredge
+states_w_lists_one_plusnona <- na.exclude(states_w_lists_one_plus)
+
+#Mut
+listed_mutnbnona <- glm.nb(ListedTEBoth ~ percFederal + Mut + Total_GDP, states_w_lists_one_plusnona, na.action = na.fail)
+
+#Eco
+listed_econbnona <- glm.nb(ListedTEBoth ~ percFederal + Eco.Area + Hybrid_AtRisk + R1.Area + Extract.Total + Total_GDP, states_w_lists_one_plusnona, na.action = na.fail)
+
+dredge(listed_mutnbnona)
+#Mut, mut + perf
+dredge(listed_econbnona)
+#R1, R1 + risk, risk
+
+#Compare top models from both (AICc delta < 2 of top model)
+#General function explaining number listed
+listed <- function(x){
+  fml <- as.formula(paste("ListedTEBoth ~ ", paste(x)))
+  listed_mod_dummy <- glm.nb(fml, states_w_lists_one_plus)
+}
+
+#Combo of top explan vars
+listed_vars <- list(
+  mut = "Mut",
+  mutperf = "Mut + percFederal",
+  r1 = "R1.Area",
+  r1risk = "R1.Area + Hybrid_AtRisk",
+  risk = "Hybrid_AtRisk"
+)
+
+listed_top_mods <- lapply(listed_vars, listed)
+
+#Add null
+listed_top_mods$null <- glm.nb(ListedTEBoth ~ 1, states_w_lists_one_plus)
+
+#Simulate residuals
+for (i in listed_top_mods) {
+  resid <- simulateResiduals(i, n = 1000, plot = TRUE)
+
+} 
+
+aictab(listed_top_mods) #Mut, Mut + percfed
+
+listed_top_mods <- list(
+  listed_top_mods$mut,
+  listed_top_mods$mutperf
+)
+
+
+for (i in listed_top_mods){
+  print(summary(i))
+  print (Anova(i))} 
+
+```
+
+# 5 Figures
+Now for the fun part: Making pretty pictures for all of our data!
+
+## North America
+Graph showing conservation assessments for all described species in North America. The first half of this code generates the necessary dataframe of combined North American species summary and described species counts
+```{r North America Described Assessed}
+north_amer <- read.csv(here("data", "North_American_Nat_Serve_Spec.csv"))
+
+#Convert to factor
+north_amer <- north_amer |>
+  mutate(across(c(Order, Family, Genus, Global_Number, assessed, at_risk, status, state_protected, fed_protected), as.factor))
+
+#Count entries per order
+order_entries <- north_amer %>%
+  group_by(Order) %>%
+  summarize(count=n())
+
+#Rename column
+order_entries <- order_entries%>% rename(entries=count)
+
+#Count entries in each order with each status
+order_by_status <- north_amer %>%
+  group_by(Order, status) %>%
+  summarise(count = n())
+
+#Pivot to wide
+order_by_status <- pivot_wider(order_by_status, names_from = status, values_from = count)
+
+#Replace nas with 0s
+order_by_status[is.na(order_by_status)] <- 0
+
+#Merge
+north_amer_orders <- merge(order_entries, order_by_status, by = "Order", all.x = TRUE)
+remove(order_entries)
+remove(order_by_status)
+
+#Add assessed column
+north_amer_orders <- north_amer_orders %>%
+  mutate(assessed = assessed_norisk + assessed_risk + assessed_extinct)
+
+described_all <- read.csv(here("data", "described_final.csv"))
+
+#Just order and described
+described_orders <- described_all[,1:2]
+
+#Remove white space
+described_orders$Order <- trimws(described_orders$Order)
+
+#Merge with count of entries on NatureServe
+north_amer_orders <- merge(described_orders, north_amer_orders, by='Order', all.x=TRUE)
+remove(described_orders)
+
+#Replce nas for entries with 0s
+north_amer_orders$entries[is.na(north_amer_orders$entries)] <- 0
+
+#Calculate percent of described species with entries by order
+north_amer_orders$perc_NorthAmerentries <- (north_amer_orders$entries/north_amer_orders$northAmerDescribed)*100
+
+#--------------------------------------------------------------
+
+#Remove Acari, which are not in described species counts
+#north_amer_orders_no_acari <- north_amer_orders %>%
+  #filter(Order != "Ixodida" & Order != "Mesostigmata" & Order != "Sarcoptiformes" & Order != "Trombidiformes")
+
+#Calculate number described species without entries
+#north_amer_orders_no_acari <- north_amer_orders_no_acari %>%
+north_amer_orders<-north_amer_orders %>%
+  mutate(no_entry = northAmerDescribed - entries)
+
+#Keep just orders with 100 or more described species
+north_amer_hundred <- north_amer_orders %>%
+  filter(northAmerDescribed >= 100)
+
+#Keep just columns with actual counts
+north_amer_graph_dat <- north_amer_hundred %>%
+  dplyr::select(c(Order:assessed,no_entry))
+
+remove(north_amer_orders_no_acari, north_amer_no_acari_hundred)
+
+#Pivot longer
+north_amer_graph_dat <- pivot_longer(north_amer_graph_dat,
+    cols = c('not_assessed', "assessed_norisk", "assessed_risk", "assessed_extinct", "no_entry"),
+    names_to='Status',
+    values_to = 'Species')
+
+#Reorder for graph
+north_amer_graph_dat$Status <- fct_relevel(north_amer_graph_dat$Status, "assessed_extinct", "assessed_risk", "assessed_norisk", "not_assessed", "no_entry")
+
+#Preview window
+#windows(width=7, height=5)
+
+#Graph
+descr_graph <- 
+
+ggplot(north_amer_graph_dat, aes(y=Species, x=reorder(Order,-Species), fill=Status)) + geom_bar(position="stack", stat="identity") +
+   scale_fill_manual(labels = c("Assessed, Extinct", "Assessed, At-Risk", "Assessed, Stable", "Not Assessed", "No Entry"), values=c("black","#a45851", "#d0e2af", "#b0cbe7", "#5d74a5")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Number of Species") +
+  theme_classic()+
+  theme(legend.position = "bottom", text = element_text(size=10), axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust=1), axis.title.y = element_text(margin = margin(r = 10)))
+
+#ggsave(descr_graph, "northamer.pdf", width=7,height=5)
+
+
+#Inset
+#Start with dataframe created in By Order section
+#Species with more than 50 at risk
+north_amer_orders <- north_amer_orders %>%
+  filter(assessed_risk >= 50)
+
+#Calculate percentage of entries per status
+north_amer_orders <- north_amer_orders %>%
+  mutate(percRiskEntry = (assessed_risk/entries)*100) %>%
+  mutate(percNoriskEntry = (assessed_norisk/entries)*100) %>%
+  mutate(percExtinctEntry = (assessed_extinct/entries)*100) %>%
+  mutate(percNoassessEntry = (not_assessed/entries)*100)
+
+#Keep only percentage of entries
+north_amer_perc_entry <- north_amer_orders %>%
+  dplyr::select(c(Order,percRiskEntry:percNoassessEntry))
+
+#Pivot longer
+north_amer_perc_entry<- pivot_longer(north_amer_perc_entry,
+             cols = c('percRiskEntry', 'percNoriskEntry', 'percExtinctEntry', 'percNoassessEntry'),
+             names_to = 'Status',
+             values_to = 'Percent')
+
+#Get percRiskEntry column again for ordering x-axis
+percriskentry_order<-north_amer_orders %>%
+  dplyr::select(c(Order,percRiskEntry))
+
+#Add
+north_amer_perc_entry<-merge(north_amer_perc_entry,percriskentry_order,all.x = TRUE)
+
+#Preview window
+#windows(width=3, height=3)
+
+#Create graph of percentage of entries  
+  ggplot(north_amer_perc_entry, aes(y=Percent, x=reorder(Order,-percRiskEntry), fill=Status)) + 
+    geom_bar(position="stack", stat="identity") +
+   scale_fill_manual(values=c("black", "#b0cbe7","#d0e2af", "#a45851")) +
+   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Percent of Entries") +
+  theme_classic()+
+theme(legend.position = "none", text = element_text(size=12), axis.title.x = element_blank(), axis.text.x = element_blank())
+        #element_text(angle = 45, hjust=1))
+#ggsave("inset.pdf", width=3, height=3)
+
+#-----------------------------------------------------------------
+#Just the orders with < 100 described species
+north_amer_less <- north_amer_orders %>%
+  filter(northAmerDescribed < 100)
+
+#Keep just columns with actual counts
+north_amer_graph_dat_less <- north_amer_less %>%
+  dplyr::select(c(Order:assessed,no_entry))
+
+#Pivot longer
+north_amer_graph_dat_less <- pivot_longer(north_amer_graph_dat_less,
+    cols = c('not_assessed', "assessed_norisk", "assessed_risk", "assessed_extinct", "no_entry"),
+    names_to='Status',
+    values_to = 'Species')
+
+#Reorder for graph
+north_amer_graph_dat_less$Status <- fct_relevel(north_amer_graph_dat_less$Status, "assessed_extinct", "assessed_risk", "assessed_norisk", "not_assessed", "no_entry")
+
+sum(north_amer_graph_dat_less$northAmerDescribed)
+
+#Preview window
+#windows(width=7, height=5)
+
+#Graph
+less_descr_graph <- 
+ggplot(north_amer_graph_dat_less, aes(y=Species, x=reorder(Order,-northAmerDescribed), fill=Status)) + geom_bar(position="stack", stat="identity") +
+   scale_fill_manual(labels = c("Assessed, Extinct", "Assessed, At-Risk", "Assessed, Stable", "Not Assessed", "No Entry"), values=c("black","#a45851", "#d0e2af", "#b0cbe7", "#5d74a5")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Number of Species") +
+  theme_classic()+
+  theme(legend.position = "bottom", text = element_text(size=10), axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust=1), axis.title.y = element_text(margin = margin(r = 10)))
+
+#ggsave("northamerless.pdf", width=7,height=5)
+
+remove(north_amer_graph_dat, north_amer_perc_assess,north_amer_perc_entry,percrisk_order,percriskentry_order, described_100, described_noacri,north_amer_orders, order_assessed)
+```
+
+## US At-Risk 
+Here we are looking at all at-risk species in the US and which have state and federal protections
+```{r At-Risk Protected}
+species_full <- read.csv(here("data", "USspecies_final.csv"))
+
+#Set as factors
+species_full <- species_full |>
+  mutate(across(c(Class, Order, Family,
+              Genus, Global_Number, US_Number, Hybrid_Number, Protected, State_Protected, Fed_Protected, Protected_Lvl), as.factor))
+
+
+#Keep just the at-risk entries
+species_atrisk <- species_full |>
+  filter(Global_Number == "1" | Global_Number == "2" | Global_Number == "3")
+
+#Reorder levels
+species_atrisk$Protected_Lvl <- fct_relevel(species_atrisk$Protected_Lvl , "Fed", "Both", "State", "None")
+
+#Preview window
+#windows(width=3.42, height=3.42)
+
+#Graph
+#us_atrisk_plot<-
+  
+  ggplot(species_atrisk, aes(x=fct_reorder(Order, Order, .fun=length, .desc=TRUE), fill = Protected_Lvl))+
+  geom_bar() +
+      # +
+  theme_classic()+
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  scale_fill_manual("Level of Protection", labels=c("Federal", "State & Federal", "State(s)", "Unprotected"),values = c('#dcbe9b',"#009474", '#11c2b5','#a45851'))+
+  labs(
+    x= NULL,
+    y= "Known At-Risk U.S. Species")+
+  theme(axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 45, hjust=1), text = element_text(size=8),
+  legend.position = "bottom"
+)
+
+#ggsave("us_atrisk.pdf", width=3.42,height=3.42)
+
+remove(species_atrisk)
+
+```
+
+## Protected Species
+This is just the protected species by order at the federal and state level
+```{r Protected Species}
+
+stfednorpt <- read.csv(here("data", "stfednorpt_final.csv"))
+
+#Set as factors
+stfednorpt <- stfednorpt |>
+  mutate(across(c(Class, Order, Family, Genus, Predator, Aquatic, Fed_Protected, Where_Protected, Ohio_Odon, Cont_Amer), as.factor))
+
+#Fed Protected only
+fed_protected <-stfednorpt |>
+  filter(Fed_Protected == 1)
+
+#Preview
+#windows(width = 7, height = 3)
+
+#Graph
+fed_order <- 
+  ggplot(fed_protected, aes(x=fct_reorder(Order, Order, .fun=length, .desc=TRUE)))+
+geom_bar(fill = "#dcbe9b")  +
+  geom_text(stat = "count",aes(label = ..count..), vjust = -0.5, size = 3) +
+labs(y = "Federally Protected Species") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  theme(text = element_text(size = 8),axis.title.x = element_blank(), axis.text=element_text(size=8))+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + coord_cartesian(clip = "off")
+
+#ggsave("fed_protected.pdf", plot = fed_order, width=7,height=3)
+
+
+#State Protected only
+state_protected <-stfednorpt |>
+  filter(State_Protected == 1)
+
+#windows(width = 7, height = 3)
+
+#Graph
+state_order <- 
+  ggplot(state_protected, aes(x=fct_reorder(Order, Order, .fun=length, .desc=TRUE)))+
+geom_bar(fill = "#11c2b5")  +
+  geom_text(stat = "count",aes(label = ..count..), vjust = -0.5, size = 3) +
+labs(y = "State Protected Species") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  theme(text = element_text(size = 8),axis.title.x = element_blank(), axis.text=element_text(size=8))+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + coord_cartesian(clip = "off")
+
+#ggsave("state_protected.pdf", plot = state_order, width=7,height=3)
+
+#grid.arrange(fed_order,state_order, ncol = 1, nrow=2)
+
+remove(fed_protected,state_protected)
+```
+
+
+## State Laws
+Significant predictors of state policies
+```{r State Laws}
+states <- read.csv(here("data", "states_final.csv"))
+
+#Convert variables to factors
+states <- states |>
+  mutate(across(c(State, SESA, Ins.ArachIncl,Region), as.factor))
+
+#Preview window
+#windows(width=2.3, height=2.3)
+
+#Boxplot of whether states have SESA
+sesa_graph<- 
+ggplot(states, aes(x=SESA, y=Extract.Total, fill = SESA))+
+  geom_boxplot()+
+    geom_signif(
+    comparisons = list(c("0", "1")),
+    map_signif_level = TRUE
+  )+
+    scale_fill_manual(values=c("#2d4030", "#11c2b5")) +
+  theme_classic()+
+  theme(text = element_text(size = 8))+
+  scale_x_discrete(labels = c("No", "Yes")) +
+  labs(x = "Has State Endangered Species Act", y = "Extractive GDP (% of total GDP)") +
+  theme(legend.position = "none")
+
+#Boxplot of whether include insects and arachnids
+
+#Dataframe of states with lists
+states_w_lists <-states |>
+  filter(SESA == 1)
+
+#Create new dataframe, replace ambiguous with no
+states_w_lists_AmgN <- states_w_lists
+states_w_lists_AmgN['Ins.ArachIncl'][states_w_lists_AmgN['Ins.ArachIncl'] == 'Amg'] <- '0'
+
+incl_graph <-
+  ggplot(states_w_lists_AmgN, aes(x=Ins.ArachIncl, y=Extract.Total, fill=Ins.ArachIncl))+
+  scale_fill_manual(values=c("#dec000", "#11c2b5")) +
+  geom_boxplot()+
+  geom_signif(
+    comparisons = list(c("0", "1")),
+    map_signif_level = TRUE
+  )+
+  theme_classic() +
+  theme(text = element_text(size = 8))+
+   scale_x_discrete(labels = c("No", "Yes")) +
+  labs(x = "Includes Insects & Arachnids", y = "Extractive GDP (% of total GDP)") +
+  theme(legend.position = "none")
+
+
+#Boxplot of ecocentric vs number species listed
+
+#Limit to only states with 1 or more species listed
+states_w_lists_one_plus <-states |>
+  filter(ListedTEBoth >= 1)
+
+#listed_graph<-
+  ggplot(states_w_lists_one_plus, aes(x=Mut, y=ListedTEBoth))+
+  geom_point(size=3, color="#11c2b5")+
+  theme_classic()+
+    theme(text = element_text(size = 8))+
+  labs(x="% Eco-Centric Values", y="State Protected Insects and Arachnids")+
+  geom_smooth(method = loess,linewidth=1.5, color="black") +
+     stat_regline_equation()
+
+#windows(width=7,height=2.3)
+#state_graphs<-grid.arrange(sesa_graph,incl_graph,listed_graph, ncol = 3, nrow=1)
+#ggsave("states.pdf", plot=state_graphs, width=7, height=2.3)
+```
+
+## Birds
+How do federal protections for birds compare to protections for our 6+ legged friends?
+```{r Bird Graph}
+#Birds
+birds <- read.csv(here("data", "USbirds.csv"))
+
+#Set factors
+birds <- birds|>
+  mutate(across(c(Hybrid_Number, Fed_Protected), as.factor))
+
+#Create count of federally protected and unprotected at-risk species
+protected_bird_count <- birds |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3") %>%
+  group_by(Fed_Protected, Class) %>%
+  summarize(count=n())
+
+#Count total at-risk birds
+total_risk_birds <- birds |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3")%>%
+    summarize(count=n())
+#Add total column
+protected_bird_count$total<-as_vector(total_risk_birds)
+
+#Add percent column
+protected_bird_count <- protected_bird_count %>%
+  mutate(perc = ((count/total)*100))
+  
+#Bugs
+species_full <- read.csv(here("data", "USspecies_final.csv"))
+
+#Set as factors
+species_full <- species_full |>
+  mutate(across(c(Class, Order, Family,
+              Genus, Global_Number, US_Number, Hybrid_Number, Protected, State_Protected, Fed_Protected, Protected_Lvl), as.factor))
+
+#Keep just the US at-risk entries
+protected_bug_count <- species_full |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3") %>%
+  group_by(Fed_Protected, Class) %>%
+  summarize(count=n())
+
+#Count total at-risk arachnids and insects
+total_risk_bugs <- species_full |>
+  filter(Hybrid_Number == "1" | Hybrid_Number == "2" | Hybrid_Number == "3")%>%
+  group_by(Class)%>%
+    summarize(count=n())
+
+#Rename
+total_risk_bugs <- total_risk_bugs%>% rename(total=count)
+
+#Add total column
+protected_bug_count<-merge(protected_bug_count,total_risk_bugs, by = "Class", all = TRUE)
+
+#Add percent column
+protected_bug_count <- protected_bug_count %>%
+  mutate(perc = ((count/total)*100))
+
+#Merge 
+birds_and_bugs <- bind_rows(protected_bird_count, protected_bug_count)
+
+#Remove
+remove(total_risk_birds, total_risk_bugs, protected_bird_count, protected_bug_count)
+
+#Preview window
+#windows(width=3, height=2)
+
+#Graph
+#Counts
+ birds_count_graph <- ggplot(birds_and_bugs, aes(x=Class, y= count, fill = Fed_Protected))+
+  geom_bar(stat = "identity") +
+  theme_classic()+
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+scale_fill_manual("Federal Status", labels=c("Unprotected", "Protected"),values = c('#a45851', '#dcbe9b'))+
+  labs(
+    x= NULL,
+    y= "Known At-Risk US Species")+
+  theme(axis.title.x = element_blank(), text = element_text(size=8))
+
+#Preview window
+#windows(width=3, height=2)
+
+#Perc
+birds_perc_graph<- 
+ ggplot(birds_and_bugs, aes(y=perc, x=reorder(Class,-count), fill=Fed_Protected)) + 
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_manual("Federal Status", labels=c("Unprotected", "Protected"),values = c('white','#dcbe9b')) +
+   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Percent Federally Protected At-Risk Species", text=element_text(size=10)) +
+  theme_classic()+
+      theme(axis.title.x = element_blank(), text = element_text(size=8),legend.position = "none")
+ 
+#ggsave("birds_inset.pdf", plot = birds_perc_graph, width = 3, height = 2.4)
+
+ 
+#Just percent protected
+protected_birds_and_bugs <- birds_and_bugs |>
+  filter(Fed_Protected == "1")
+
+#Preview window
+#windows(width=2, height=3)
+
+ ggplot(protected_birds_and_bugs, aes(y=perc, x=reorder(Class,perc))) + 
+    geom_bar(stat="identity", fill = '#dcbe9b') +
+   scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    ylim(min_value = 0, max_value = 30)+
+  labs(x = NULL, y = "Percent Federally Protected At-Risk Species", text=element_text(size=10)) +
+  theme_classic()+
+      theme(axis.title.x = element_blank(), text = element_text(size=8))
+
+ 
+#ggsave("birds_inset.pdf", plot = birds_perc_graph, width = 3, height = 2)
+ 
+
+#birds_bugs_graphs<-grid.arrange(birds_count_graph,birds_perc_graph, ncol = 2, nrow=1)
+#ggsave("birds.pdf", plot=birds_bugs_graphs, width=7, height=2.3)
+
+remove(total_risk_birds, total_risk_bugs,protected_bird_count,protected_bug_count,birds)
+```
+
+## State Listing Status
+The status of state protected species in the state where they are listed, their hybrid rank, and how many are also federally protected
+```{r State listing status}
+state_status <- read.csv(here("data", "state_status.csv"))
+
+state_only<-state_status[c("State_abbrev", "ListedTEBoth", "Listed_AtRisk", "Listed_Extinct", "Listed_Stable", "Listed_NotRanked")]
+
+
+#Covert to long
+state_only <- state_only %>%
+  pivot_longer(
+    cols = c('Listed_AtRisk', 'Listed_Extinct', "Listed_NotRanked", "Listed_Stable"),
+    names_to='Status',
+    values_to = 'Species'
+  )
+
+#Preview window
+#windows(width = 7, height = 3)
+
+#State status
+state_only_graph <- 
+  ggplot(state_only, aes(x=reorder(State_abbrev,-ListedTEBoth), y=Species, fill = Status))+
+  geom_bar(position="stack", stat="identity")+
+    scale_fill_manual("Status in Listed State", labels = c("At Risk", "Extinct", "Not Assessed", "Stable"), values=c("#a45851", "black", "#b0cbe7", "#d0e2af")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "State Listed Species") +
+  theme_classic()+
+    theme(legend.position = "bottom")
+
+#-----------------------------------------------------------------------
+#Hybrid Rank of state listed species
+state_hybrid<-state_status[c("State_abbrev", "ListedTEBoth", "Hybrid_AtRisk", "Hybrid_Extinct", "Hybrid_Stable", "Hybrid_NotRanked")]
+
+#Covert to long
+state_hybrid <- state_hybrid %>%
+  pivot_longer(
+    cols = c('Hybrid_AtRisk', 'Hybrid_Extinct', "Hybrid_NotRanked", "Hybrid_Stable"),
+    names_to='Status',
+    values_to = 'Species'
+  )
+
+#Graph
+state_hybrid <- 
+ggplot(state_hybrid, aes(x=reorder(State_abbrev,-ListedTEBoth), y=Species, fill = Status))+
+  geom_bar(position="stack", stat="identity")+
+    scale_fill_manual("Hybrid Rank", labels = c("At Risk", "Extinct", "Not Assessed", "Stable"), values=c("#a45851", "black", "#b0cbe7", "#d0e2af")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "State Listed Species") +
+  theme_classic()+
+    theme(legend.position = "bottom")
+
+#------------------------------------------------------------------------
+#State lists of federally protected
+state_fedstatus<-state_status[c("State_abbrev", "ListedTEBoth", "Listed_Fed_Protected")]
+
+#Calculate listed species without federal protection
+state_fedstatus$Listed_Fed_Unprotected <- state_fedstatus$ListedTEBoth-state_fedstatus$Listed_Fed_Protected
+
+#Convert long
+state_fedstatus <- state_fedstatus %>%
+  pivot_longer(
+    cols = c('Listed_Fed_Protected', 'Listed_Fed_Unprotected'),
+    names_to='Federal_Status',
+    values_to = 'Species'
+  )
+
+#Graph
+state_fed_listing_graph <- 
+   ggplot(state_fedstatus, aes(x=reorder(State_abbrev, -ListedTEBoth), y=Species, fill = Federal_Status))+
+  geom_bar(position="stack", stat="identity")+
+    scale_fill_manual("Federal Status", labels = c("Protected", "Unprotected"), values=c('#dcbe9b', '#11c2b5')) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "State Listed Species") +
+  theme_classic()+
+     theme(legend.position = "bottom")
+
+
+#state_status_graphs<-grid.arrange(state_only_graph,state_hybrid, state_fed_listing_graph, ncol = 1, nrow=3)
+
+#ggsave("state_statuses.pdf", plot=state_status_graphs, width=7, height=9)
+
+```
+
+## Petition
+Federal petition status by order
+```{r Petition Figure}
+fed_petition <- read.csv(here("data", "fed_final.csv"))
+
+#Convert variables to factors
+fed_petition <- fed_petition |>
+  mutate(across(c(Class, Order, Hybrid_Number,petition,aquatic,predator), as.factor))
+
+#Preview
+#windows(width = 7, height = 3)
+
+#Order by petition status
+pet_order<- 
+ggplot(fed_petition, aes(x=fct_reorder(Order, Order, .fun=length, .desc=TRUE), fill=petition)) + 
+    geom_bar()+
+  theme_classic()+
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+scale_fill_manual(" ", labels=c("USFWS", "Public Petition"),values = c('#0f85a0','#dd4124'))+
+  labs(
+    x= NULL,
+    y= "Listed Species")+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),text = element_text(size = 8), axis.text=element_text(size=8))
+
+#ggsave("petitionorder.pdf", plot=pet_order, width=7, height=4.5)
+
+```
+
