@@ -1,0 +1,174 @@
+---
+title: "Walsh_Figueroa_Data_Cleaning"
+author: "Wes Walsh"
+date: "2025-10-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+```{r Load packages, include=FALSE}
+#Get packages used
+require(here)
+library(tidyverse)
+library(rgbif)
+
+#citation()
+#version$version.string
+```
+
+NatureServe Full Canada and US download
+Report Generated October 16, 2025
+Search Criteria: 
+Include only full species.
+Include only species with accepted taxonomy.
+Location: Canada, United States
+Origin: Native
+Scientific Taxonomy: CLASS Arachnida (Animalia),CLASS Insecta (Animalia)
+
+#Get Data
+```{r Get data}
+
+na_full <- read.csv(here("data", "natureserve_NA_noexotic_full.csv"))
+
+#Remove blank entries
+na_full <- na_full[-which(na_full$scientificName == ""), ]
+
+#Convert to factor
+na_full <- na_full |>
+  mutate(across(c(Global_Ranked, Global_Rank_Rnd), as.factor))
+
+
+```
+
+#Match to GBIF Backbone
+```{r GBIF match}
+
+#Just scientific name column
+scientificName <- na_full["scientificName"]
+
+#Match names against GBIF backbone
+name_match <- name_backbone_checklist(scientificName)
+
+#Just taxonomy
+taxonomy <- name_match %>%
+      dplyr::select(verbatim_name,synonym,class,order,family,genus) %>%
+      rename(scientificName = verbatim_name)
+
+#Merge based on name
+scientificName <- merge(scientificName, taxonomy, by='scientificName', all.y=TRUE)
+
+```
+
+#Format NatureServe
+```{r Format NatureServe}
+#Merge based on name
+na_full <- merge(scientificName,na_full, by = 'scientificName', all.x=TRUE)
+
+
+#Just columns I want
+na_full <- na_full %>%
+      dplyr::select(scientificName, synonym, class, order, family, genus, commonName, Synonyms, Species.Group..Fine., Global_Ranked, Global_Rank_Rnd, U.S..Endangered.Species.Act.Status, Distribution, View.on.NatureServe.Explorer)
+
+#Save as csv file
+write.csv(na_full, "NA_full_taxonomy.csv")
+
+```
+
+NatureServe US Download
+Report Generated October 16, 2025
+Search Criteria: 
+Include full species, subspecies, varieties, and populations.
+Include only species with accepted taxonomy.
+Location: United States
+Origin: Native
+Scientific Taxonomy: CLASS Arachnida (Animalia),CLASS Insecta (Animalia)
+
+#Get Data
+```{r Get data}
+
+us_full <- read.csv(here("data", "us_full_noexotic.csv"))
+
+#Rename column
+us_full <- us_full %>%
+  rename(scientificName = Scientific.Name)
+
+#Remove blank entries
+us_full <- us_full[-which(us_full$scientificName == ""), ]
+
+```
+
+#Match to GBIF Backbone
+```{r GBIF match}
+
+#Just scientific name column
+us_scientificName <- us_full["scientificName"]
+
+#Match names against GBIF backbone
+name_match <- name_backbone_checklist(us_scientificName)
+
+#Just taxonomy
+taxonomy <- name_match %>%
+      dplyr::select(verbatim_name,synonym,class,order,family,genus) %>%
+      rename(scientificName = verbatim_name)
+
+#Merge based on name
+us_scientificName <- merge(us_scientificName, taxonomy, by='scientificName', all.y=TRUE)
+
+```
+
+#Format NatureServe
+```{r Format NatureServe}
+#Merge based on name
+us_full <- merge(us_scientificName,us_full, by = 'scientificName', all.x=TRUE)
+
+
+#Just columns I want
+us_full <- us_full %>%
+      dplyr::select(scientificName, synonym, class, order, family, genus, Common.Name, Synonyms, Species.Group..Fine., NatureServe.Global.Rank, NatureServe.Rounded.Global.Rank, U.S..Endangered.Species.Act.Status, Distribution, View.on.NatureServe.Explorer)
+
+#Save as csv file
+write.csv(us_full, "us_full_taxonomy.csv")
+
+```
+
+BIRDS
+
+#Get Data
+```{r Get data}
+
+us_fullbirds <- read.csv(here("data", "us_fullbirds_noexotic.csv"))
+
+```
+
+#Match to GBIF Backbone
+```{r GBIF match}
+
+#Just scientific name column
+usbirds_scientificName <- us_fullbirds["scientificName"]
+
+#Match names against GBIF backbone
+name_match <- name_backbone_checklist(usbirds_scientificName)
+
+#Just taxonomy
+taxonomy <- name_match %>%
+      dplyr::select(verbatim_name,class,order,family,genus) %>%
+      rename(scientificName = verbatim_name)
+
+#Merge based on name
+usbirds_scientificName <- merge(usbirds_scientificName, taxonomy, by='scientificName', all.y=TRUE)
+
+```
+
+#Format NatureServe
+```{r Format NatureServe}
+#Merge based on name
+us_fullbirds <- merge(usbirds_scientificName,us_fullbirds, by = 'scientificName', all.x=TRUE)
+
+#Save as csv file
+write.csv(us_fullbirds, "us_fullbirds_taxonomy.csv")
+
+```
